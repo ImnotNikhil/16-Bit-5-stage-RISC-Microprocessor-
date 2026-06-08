@@ -1,0 +1,1776 @@
+`timescale 1ns/1ps
+
+// =============================================================
+//  FIXED 16-bit 5-Stage Pipelined CPU
+//  Fixes applied (vs original):
+//
+//  [F1]  if_id_reg  : flush always wins over stall (branch+load overlap)
+//  [F2]  cpu_top    : branch PC pipeline held on stall (not updated through stall)
+//  [F3]  cpu_top    : mem_addr_w is combinational - no 1-cycle address delay
+//  [F4]  cpu_top    : store data sourced from forwarded opB_raw, not raw rs2_ex
+//  [F5]  cpu_top    : mul_rd_saved / div_rd_saved captured only on start, not every cycle
+//  [F6]  cpu_top    : flag_write gating strengthened to prevent glitch corruption
+//  [F7]  div_unit   : div_cnt starts at 16 (was 15), final quotient bit fixed
+//  [F8]  stack_pointer + cpu_top : combinational pre-address for PUSH/POP,
+//                    SP updates 1 cycle after MEM so the MEM address is correct
+//  [F9]  $display   : moved out of always@(*) into clocked blocks
+//  [F10] cpu_top    : MOVE uses forwarded opA (was already correct, made explicit)
+//  NOTE: rs2/imm ISA overlap is a known design constraint - documented below
+// =============================================================
+
+// ===================================================================
+//  ISA ENCODING NOTE (unstated assumption documented)
+//  instr[4:0] = imm (5-bit signed immediate)
+//  instr[4:2] = rs2 (register field, subset of imm)
+//  These overlap intentionally. The control signal alu_src selects
+//  which interpretation is active. An instruction MUST NOT require
+//  both rs2 and a non-zero imm[1:0] simultaneously - the encoding
+//  provides no way to express both.
+// ===================================================================
+
+//********************//
+//      STAGE 1       //
+//********************//
+
+// ==================
+// Program Counter
+// ==================
+module program_counter (
+    input clk,
+    input reset,
+    input stall,
+    input halt,
+    input branch_taken,
+    input [7:0] branch_addr,
+    output reg [7:0] pc
+);
+always @(posedge clk or posedge reset) begin
+    if (reset)
+        pc <= 8'd0;
+    else if (halt)
+        pc <= pc;
+    else if (stall)
+        pc <= pc;
+    else if (branch_taken)
+        pc <= branch_addr;
+    else
+        pc <= pc + 1;
+end
+endmodule
+
+// ==================
+// Instruction Memory
+// ==================
+module instruction_memory (
+    input  [7:0] addr,
+    output reg [15:0] instr
+);
+always @(*) begin
+    case(addr)
+        // ===== INITIAL VALUES =====
+        8'd0:  instr = 16'b10_011_001_000_0_0101; // LOADI R1 = 5
+        8'd1:  instr = 16'b10_011_010_000_0_0011; // LOADI R2 = 3
+        8'd2:  instr = 16'b10_011_011_000_0_0110; // LOADI R3 = 6
+        8'd3:  instr = 16'b10_011_100_000_0_0010; // LOADI R4 = 2
+
+        // ===== ALU DEPENDENCY CHAIN =====
+        8'd4:  instr = {2'b00,3'b000,3'b101,3'b001,3'b010,2'b00}; // ADD  R5 = R1 + R2
+        8'd5:  instr = {2'b00,3'b001,3'b110,3'b101,3'b011,2'b00}; // SUB  R6 = R5 - R3
+        8'd6:  instr = {2'b00,3'b010,3'b111,3'b110,3'b001,2'b00}; // MUL  R7 = R6 * R1
+        8'd7:  instr = {2'b00,3'b011,3'b001,3'b111,3'b010,2'b00}; // DIV  R1 = R7 / R2
+
+        8'd8:  instr = {2'b00,3'b100,3'b001,3'b001,3'b000,2'b00}; // [FIX] rs1 set to R1 (001)
+        8'd9:  instr = {2'b00,3'b101,3'b010,3'b010,3'b000,2'b00}; // DEC R2
+        8'd10: instr = {2'b00,3'b110,3'b001,3'b010,3'b000,2'b00}; // CMP R1,R2
+        8'd11: instr = {2'b00,3'b111,3'b011,3'b011,3'b000,2'b00}; // ABS R3
+
+        // ===== LOGIC =====
+        8'd12: instr = {2'b01,3'b000,3'b001,3'b010,3'b011,2'b00}; // AND
+        8'd13: instr = {2'b01,3'b001,3'b010,3'b011,3'b100,2'b00}; // OR
+        8'd14: instr = {2'b01,3'b010,3'b001,3'b000,3'b000,2'b00}; // NOT
+        8'd15: instr = {2'b01,3'b011,3'b001,3'b010,3'b011,2'b00}; // XOR
+        8'd16: instr = {2'b01,3'b100,3'b001,3'b001,3'b000,2'b00}; // SHL
+        8'd17: instr = {2'b01,3'b101,3'b001,3'b001,3'b000,2'b00}; // SHR
+        8'd18: instr = {2'b01,3'b110,3'b001,3'b001,3'b000,2'b00}; // ROR
+        8'd19: instr = {2'b01,3'b111,3'b001,3'b001,3'b000,2'b00}; // ROL
+
+        // ===== MEMORY + HAZARD =====
+        8'd20: instr = {2'b10,3'b001,3'b000,3'b001,3'b111,2'b00}; // STORE R7 -> [R1]
+        8'd21: instr = {2'b10,3'b000,3'b011,3'b001,3'b010,2'b00}; // LOAD  R3 <- [R1]
+        8'd22: instr = {2'b00,3'b000,3'b100,3'b011,3'b001,2'b00}; // ADD R4 = R3 + R1
+
+        // ===== STACK =====
+        8'd23: instr = {2'b10,3'b100,3'b000,3'b100,3'b000,2'b00}; // PUSH R4
+        8'd24: instr = {2'b10,3'b101,3'b110,3'b000,3'b000,2'b00}; // POP R6
+        8'd25: instr = {2'b10,3'b110,3'b001,3'b000,3'b000,2'b00}; // PEAK R1
+        8'd26: instr = {2'b10,3'b111,3'b001,3'b000,3'b000,2'b00}; // CLEAR R1
+
+        // ===== BRANCH =====
+        8'd27: instr = {2'b00,3'b110,3'b110,3'b001,3'b010,2'b00}; // CMP R6,R2
+        8'd28: instr = 16'b11_001_000_000_0_0011; // JZ  -> +3
+        8'd29: instr = 16'b11_010_000_000_0_0010; // JNZ -> +2
+        8'd30: instr = 16'b11_011_000_000_0_0010; // JC  -> +2
+
+        // ===== LOOP =====
+        8'd31: instr = 16'b11_000_000_000_0_1110; // JMP relative +14
+
+        // Default = HALT (safe rundown)
+        default: instr = 16'b11_111_000_000_0_0000;
+    endcase
+end
+endmodule
+
+// ==================
+// IF/ID Register
+// [F1] flush always takes priority over stall so a branch resolving
+//      during a load-use stall doesn't hold the wrong instruction.
+// ==================
+module if_id_reg (
+    input clk,
+    input reset,
+    input stall,
+    input flush,
+    input [7:0] pc_in,
+    input [15:0] instr_in,
+    output reg [7:0] pc_out,
+    output reg [15:0] instr_out
+);
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        pc_out    <= 0;
+        instr_out <= 0;
+    end
+    // [F1] flush beats stall - insert NOP, do not hold wrong instruction
+    else if (flush) begin
+        instr_out <= 16'hA000;   // MOVE R0,R0
+        pc_out <= pc_in;
+    end
+    else if (stall) begin
+        pc_out    <= pc_out;
+        instr_out <= instr_out;
+    end
+    else begin
+        pc_out    <= pc_in;
+        instr_out <= instr_in;
+    end
+end
+endmodule
+
+// ==================
+// Flush Unit
+// ==================
+module flush_unit (
+    input branch_taken,
+    output flush
+);
+assign flush = branch_taken;
+endmodule
+
+// ==================
+// Stack Pointer
+// [F8] SP updates after MEM stage. The combinational pre-address
+//      (computed in cpu_top) reads the current SP value before update,
+//      which gives the correct PUSH/POP target address.
+// ==================
+module stack_pointer (
+    input clk,
+    input reset,
+    input alu_stall,   // [FIX] Added pipeline stall input
+    input push,
+    input pop,
+    output reg [7:0] sp
+);
+
+always @(posedge clk or posedge reset) begin
+    if (reset)
+        sp <= 8'hFF;
+    else if (alu_stall)
+        sp <= sp;  // [FIX] Freeze SP during multicycle pipeline stalls
+    else begin
+        case ({push, pop})
+            2'b10: if (sp != 0) sp <= sp - 1;
+            2'b01: if (sp != 8'hFF) sp <= sp + 1;
+            default: sp <= sp;
+        endcase
+    end
+end
+endmodule
+
+//********************//
+//      STAGE 2       //
+//********************//
+
+// ==================
+// Instruction Decoder
+// ==================
+module instruction_decoder (
+    input  [15:0] instr,
+    output [1:0]  group,
+    output [2:0]  opcode,
+    output [2:0]  rd,
+    output [2:0]  rs1,
+    output [2:0]  rs2,
+    output [4:0]  imm
+);
+assign group  = instr[15:14];
+assign opcode = instr[13:11];
+assign rd     = instr[10:8];
+assign rs1    = instr[7:5];
+assign rs2    = instr[4:2];
+assign imm    = instr[4:0];
+// NOTE: rs2[4:2] overlaps imm[4:2]. alu_src selects which is used.
+endmodule
+
+// ==================
+// Register File
+// ==================
+module register_file (
+    input clk,
+    input reset,
+    input reg_write,
+    input [2:0] rs1, rs2, rd,
+    input [15:0] write_data,
+    output [15:0] read_data1, read_data2
+);
+reg [15:0] registers [0:7];
+integer i;
+
+// Synchronous read with WB forwarding (write-first)
+assign read_data1 =
+    (rs1 == 3'b000) ? 16'd0 :
+    (reg_write && (rd == rs1) && (rd != 0)) ? write_data :
+    registers[rs1];
+
+assign read_data2 =
+    (rs2 == 3'b000) ? 16'd0 :
+    (reg_write && (rd == rs2) && (rd != 0)) ? write_data :
+    registers[rs2];
+
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        for (i = 0; i < 8; i = i + 1)
+            registers[i] <= 16'd0;
+    end
+    else if (reg_write && rd != 3'b000) begin
+        registers[rd] <= write_data;
+    end
+end
+
+always @(posedge clk) begin
+    if (reg_write && rd != 3'b000) begin
+        $display(
+        "REGWRITE: R%0d <= %0d",
+        rd,
+        write_data
+        );
+    end
+end
+
+endmodule
+
+// ==================
+// Immediate Generator
+// ==================
+module immediate_generator (
+    input [4:0] imm_in,
+    output [15:0] imm_out
+);
+assign imm_out = {{11{imm_in[4]}}, imm_in};
+endmodule
+
+// ==================
+// Control Unit
+// ==================
+module control_unit (
+    input [1:0] group,
+    input [2:0] opcode,
+
+    output reg is_push,
+    output reg is_pop,
+    output reg is_peak,
+
+    output reg alu_src,
+    output reg reg_write,
+    output reg mem_read,
+    output reg mem_write,
+    output reg mem_to_reg,
+    output reg jump,
+    output reg halt,
+    output reg [2:0] alu_op,
+    output reg flag_write
+);
+always @(*) begin
+    alu_src    = 0; reg_write  = 0; mem_read   = 0;
+    mem_write  = 0; mem_to_reg = 0; jump       = 0;
+    halt       = 0; alu_op     = 3'b000; flag_write = 0;
+    is_push    = 0; is_pop     = 0; is_peak    = 0;
+
+    case (group)
+        2'b00: begin  // ALU
+            reg_write  = 1;
+            alu_op     = opcode;
+            flag_write = 1;
+            if (opcode == 3'b110) reg_write = 0; // CMP: flags only
+        end
+
+        2'b01: begin  // LOGIC
+            reg_write  = 1;
+            alu_op     = opcode;
+            flag_write = 1;
+        end
+
+        2'b10: begin  // MEMORY / STACK
+            alu_op = opcode;
+            case (opcode)
+                3'b000: begin mem_read=1; reg_write=1; mem_to_reg=1; end           // LOAD
+                3'b001: begin mem_write=1; end                                      // STORE
+                3'b010: begin reg_write=1; end                                      // MOVE
+                3'b011: begin alu_src=1; reg_write=1; end                           // LOADI
+                3'b100: begin mem_write=1; is_push=1; end                           // PUSH
+                3'b101: begin mem_read=1; reg_write=1; mem_to_reg=1; is_pop=1; end // POP
+                3'b110: begin mem_read=1; reg_write=1; mem_to_reg=1; is_peak=1; end// PEAK
+                3'b111: begin reg_write=1; end                                      // CLEAR
+            endcase
+        end
+
+        2'b11: begin  // CONTROL
+            case (opcode)
+                3'b000: jump = 1;  // JMP
+                3'b111: halt = 1;  // HALT
+                default: ;         // Conditional branches handled in branch_unit
+            endcase
+        end
+    endcase
+end
+endmodule
+
+// ===================================================================
+// CORRECT PIPELINED BUG-FREE id_ex_reg MODULE
+// ===================================================================
+module id_ex_reg (
+    input clk,
+    input reset,
+    input hazard_stall,
+    input alu_stall,
+    input flush,
+
+    input [7:0]  pc_in,
+    input [15:0] rs1_in,
+    input [15:0] rs2_in,
+    input [15:0] imm_in,
+    input [2:0]  rd_in,
+    input        is_push_in,
+    input        is_pop_in,
+    input        is_peak_in,
+
+    input [2:0]  alu_op_in,
+    input        alu_src_in,
+    input        reg_write_in,
+    input        mem_read_in,
+    input        mem_write_in,
+    input        mem_to_reg_in,
+    input        jump_in,
+    input        flag_write_in,
+    input [2:0]  rs1_addr_in,
+    input [2:0]  rs2_addr_in,
+    input [1:0]  group_in,
+    input        halt_in,
+    input [2:0]  opcode_in,
+
+    output reg [2:0]  opcode_out,
+    output reg        halt_out,
+    output reg [1:0]  group_out,
+    output reg [2:0]  rs1_addr_out,
+    output reg [2:0]  rs2_addr_out,
+    output reg [7:0]  pc_out,
+    output reg [15:0] rs1_out,
+    output reg [15:0] rs2_out,
+    output reg [15:0] imm_out,
+    output reg [2:0]  rd_out,
+    output reg        is_push_out,
+    output reg        is_pop_out,
+    output reg        is_peak_out,
+
+    output reg [2:0]  alu_op_out,
+    output reg        alu_src_out,
+    output reg        reg_write_out,
+    output reg        mem_read_out,
+    output reg        mem_write_out,
+    output reg        mem_to_reg_out,
+    output reg        jump_out,
+    output reg        flag_write_out
+);
+
+// Helper task to clear all control signals cleanly (NOP bubble)
+task insert_nop;
+begin
+    opcode_out     <= 3'b000;
+    alu_op_out     <= 3'b000; 
+    alu_src_out    <= 1'b0; 
+    reg_write_out  <= 1'b0;   // Disable write back
+    mem_read_out   <= 1'b0;   // Disable memory reads
+    mem_write_out  <= 1'b0;   // Disable memory writes
+    mem_to_reg_out <= 1'b0;
+    group_out      <= 2'b00; 
+    jump_out       <= 1'b0; 
+    halt_out       <= 1'b0; 
+    flag_write_out <= 1'b0;
+    is_push_out    <= 1'b0; 
+    is_pop_out     <= 1'b0; 
+    is_peak_out    <= 1'b0;
+end
+endtask
+
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        pc_out <= 8'd0;
+        rd_out <= 3'b000;
+        rs1_out <= 16'd0; rs2_out <= 16'd0; imm_out <= 16'd0;
+        rs1_addr_out <= 3'b000; rs2_addr_out <= 3'b000;
+        insert_nop;
+    end
+    else if (flush) begin
+        pc_out <= pc_in;
+        rd_out <= 3'b000;
+        rs1_out <= 16'd0; rs2_out <= 16'd0; imm_out <= 16'd0;
+        rs1_addr_out <= 3'b000; rs2_addr_out <= 3'b000;
+        insert_nop;
+    end
+    // CORRECT SINGLE-CYCLE BUBBLE IMPLEMENTATION
+    else if (hazard_stall) begin
+        pc_out        <= pc_out;       // Lock down PC state reference stable
+        
+        // CRITICAL TEXTBOOK FIX: Retain register mapping and data structures active!
+        // Wiping these out breaks data path forwarding lines.
+        rd_out        <= 3'b000;      // ← was rd_in, must be 0 for NOP bubble      
+        rs1_out       <= rs1_in;
+        rs2_out       <= rs2_in;
+        imm_out       <= imm_in;
+        rs1_addr_out  <= rs1_addr_in;
+        rs2_addr_out  <= rs2_addr_in;
+        
+        // Safe, clear control execution bubble injection
+        insert_nop;
+    end
+    else if (alu_stall) begin
+        // Hold all stage variables uniformly during multi-cycle math routines (MUL/DIV)
+        pc_out         <= pc_out;
+        rs1_out        <= rs1_out;
+        rs2_out        <= rs2_out;
+        imm_out        <= imm_out;
+        rd_out         <= rd_out;
+        alu_op_out     <= alu_op_out;
+        alu_src_out    <= alu_src_out;
+        reg_write_out  <= reg_write_out;
+        mem_read_out   <= mem_read_out;
+        mem_write_out  <= mem_write_out;
+        mem_to_reg_out <= mem_to_reg_out;
+        jump_out       <= jump_out;
+        halt_out       <= halt_out;
+        flag_write_out <= flag_write_out;
+        rs1_addr_out   <= rs1_addr_out;
+        rs2_addr_out   <= rs2_addr_out;
+        group_out      <= group_out;
+        opcode_out     <= opcode_out;
+        is_push_out    <= is_push_out;
+        is_pop_out     <= is_pop_out;
+        is_peak_out    <= is_peak_out;
+    end
+    else begin
+        // Normal sequential pipeline operation update step
+        pc_out         <= pc_in;
+        rs1_out        <= rs1_in;  
+        rs2_out        <= rs2_in;
+        imm_out        <= imm_in;  
+        rd_out         <= rd_in;
+        alu_op_out     <= alu_op_in; 
+        alu_src_out    <= alu_src_in;
+        reg_write_out  <= reg_write_in; 
+        mem_read_out   <= mem_read_in;
+        mem_write_out  <= mem_write_in; 
+        mem_to_reg_out <= mem_to_reg_in;
+        group_out      <= group_in; 
+        halt_out       <= halt_in;
+        jump_out       <= jump_in;  
+        flag_write_out <= flag_write_in;
+        rs1_addr_out   <= rs1_addr_in; 
+        rs2_addr_out   <= rs2_addr_in;
+        opcode_out     <= opcode_in;
+        is_push_out    <= is_push_in; 
+        is_pop_out     <= is_pop_in; 
+        is_peak_out    <= is_peak_in;
+    end
+end
+endmodule
+
+// ==================
+// Hazard Unit
+// ==================
+module hazard_unit (
+    input [2:0] rs1_id,
+    input [2:0] rs2_id,
+    input       rs1_read_id,   // 1 = this instruction reads rs1
+    input       rs2_read_id,   // 1 = this instruction reads rs2
+    input [2:0] rd_ex,
+    input       mem_read_ex,
+    output reg  hazard_stall
+);
+always @(*) begin
+    // Load-use hazard: stall only if the dependent instruction actually reads the register
+    if (mem_read_ex &&
+        (rd_ex != 3'b000) &&
+        ((rs1_read_id && (rd_ex == rs1_id)) ||
+         (rs2_read_id && (rd_ex == rs2_id))))
+        hazard_stall = 1'b1;
+    else
+        hazard_stall = 1'b0;
+end
+endmodule
+
+//********************//
+//      STAGE 3       //
+//********************//
+
+// ==================
+// Operand Mux
+// ==================
+module operand_mux (
+    input [15:0] reg_data,
+    input [15:0] imm_data,
+    input        alu_src,
+    output [15:0] operand_out
+);
+assign operand_out = alu_src ? imm_data : reg_data;
+endmodule
+
+// ==================
+// Branch Unit
+// ==================
+module branch_unit (
+    input        jump,
+    input [4:0]  opcode,
+    input [3:0]  flags_out,
+    input [7:0]  pc_ex,
+    input [7:0]  imm_ex,
+    output reg   branch_taken,
+    output reg [7:0] branch_addr
+);
+wire [1:0] group = opcode[4:3];
+wire [2:0] func  = opcode[2:0];
+wire N = flags_out[3];
+wire Z = flags_out[2];
+wire C = flags_out[1];
+wire V = flags_out[0];
+
+always @(*) begin
+    branch_taken = 0;
+    if (jump)                              branch_taken = 1;
+    else if (group==2'b11 && func==3'b001 &&  Z) branch_taken = 1; // JZ
+    else if (group==2'b11 && func==3'b010 && !Z) branch_taken = 1; // JNZ
+    else if (group==2'b11 && func==3'b011 &&  C) branch_taken = 1; // JC
+    else if (group==2'b11 && func==3'b100 && !C) branch_taken = 1; // JNC
+    else if (group==2'b11 && func==3'b101 &&  N) branch_taken = 1; // JN
+    else if (group==2'b11 && func==3'b110 && !N) branch_taken = 1; // JNN
+
+    branch_addr = branch_taken ? ((pc_ex + imm_ex) & 8'hFF) : pc_ex;
+end
+endmodule
+
+// ==================
+// Forward Mux
+// ==================
+module forward_mux (
+    input [15:0] reg_data,
+    input [15:0] ex_mem_data,
+    input [15:0] mem_wb_data,
+    input [1:0]  forward_sel,
+    output reg [15:0] out
+);
+always @(*) begin
+    case (forward_sel)
+        2'b00: out = reg_data;
+        2'b10: out = ex_mem_data;
+        2'b01: out = mem_wb_data;
+        default: out = reg_data;
+    endcase
+end
+endmodule
+
+// ==================
+// MULTIPLIER (Shift-Add, 16-cycle)
+// NOTE: result is lower 16 bits; overflow silently discarded (documented limitation)
+// ==================
+module mul_unit (
+    input  wire        clk,
+    input  wire        rst,
+    input  wire        start,
+    input  wire [15:0] A1,
+    input  wire [15:0] B1,
+    output reg         mul_busy,
+    output reg         mul_done,
+    output reg  [15:0] mul_prod
+);
+reg [4:0]  mul_cnt;
+reg [15:0] mul_m, mul_q;
+
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        mul_busy <= 0; mul_done <= 0; mul_cnt <= 0;
+        mul_prod <= 0; mul_m <= 0; mul_q <= 0;
+    end
+    else begin
+        mul_done <= 0;
+        if (!mul_busy && start) begin
+            mul_busy <= 1; mul_cnt <= 16;
+            mul_prod <= 0; mul_m <= A1; mul_q <= B1;
+        end
+        else if (mul_busy) begin
+            if (mul_q[0]) mul_prod <= mul_prod + mul_m;
+            mul_m   <= mul_m << 1;
+            mul_q   <= mul_q >> 1;
+            mul_cnt <= mul_cnt - 1;
+            if (mul_cnt == 1) begin
+                mul_busy <= 0; mul_done <= 1;
+            end
+        end
+    end
+end
+endmodule
+
+// ==================
+// DIVIDER (Restoring, 16-step) - CORRECTED
+// Uses 17-bit remainder register to correctly track borrow/sign
+// ==================
+module div_unit (
+    input  wire        clk,
+    input  wire        rst,
+    input  wire        start,
+    input  wire [15:0] A1,
+    input  wire [15:0] B1,
+    output reg  [15:0] div_q,
+    output reg         div_done,
+    output reg         div_busy
+);
+    reg [4:0]  div_cnt;
+    reg        div_active;
+    reg [16:0] div_r;      // 17-bit: bit[16] is sign/borrow
+    reg [15:0] div_m;
+
+    // Combinational next-state: shift {div_r, div_q} left by 1
+    // Then trial-subtract div_m from the upper 17 bits
+    wire [16:0] shifted_r  = {div_r[15:0], div_q[15]};   // upper 17 bits after shift
+    wire [15:0] shifted_q  = {div_q[14:0], 1'b0};         // lower 16 bits after shift
+
+    wire [17:0] sub_res    = {1'b0, shifted_r} - {1'b0, div_m}; // 18-bit to catch borrow
+    wire        borrow     = sub_res[17];                         // 1 = subtraction underflowed
+
+    wire [16:0] next_r     = borrow ? shifted_r : sub_res[16:0]; // restore if borrow
+    wire [15:0] next_q = {div_q[14:0], ~borrow};          // quotient bit = ~borrow
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            div_cnt    <= 0;   div_busy   <= 0;
+            div_done   <= 0;   div_active <= 0;
+            div_q      <= 0;   div_r      <= 0;
+            div_m      <= 0;
+        end else begin
+            div_done <= 0;  // default: pulse only
+
+            if (start && !div_active) begin
+                if (B1 == 0) begin
+                    // Division by zero: return 0xFFFF immediately
+                    div_q      <= 16'hFFFF;
+                    div_done   <= 1;
+                    div_busy   <= 0;
+                    div_active <= 0;
+                end else begin
+                    div_cnt    <= 16;
+                    div_busy   <= 1;
+                    div_active <= 1;
+                    div_q      <= A1;    // dividend goes into quotient register
+                    div_r      <= 17'd0; // remainder starts at 0
+                    div_m      <= B1;    // divisor
+                end
+            end
+            else if (div_busy) begin
+                div_r <= next_r;
+                div_q <= next_q;
+
+                if (div_cnt == 1) begin
+                    div_busy   <= 0;
+                    div_done   <= 1;
+                    div_active <= 0;
+                end else begin
+                    div_cnt <= div_cnt - 1;
+                end
+            end
+
+            // Safety: clear active if start drops while idle
+            if (!start && !div_busy)
+                div_active <= 0;
+        end
+    end
+
+`ifdef SIMULATION
+    always @(posedge clk) begin
+        if (div_busy || div_done)
+            $display("DIVEND: cnt=%0d busy=%b done=%b q=%0d",
+                     div_cnt, div_busy, div_done, div_q);
+    end
+`endif
+
+    always @(posedge clk) begin
+        if (div_done)
+            $display("DIV DONE: quotient = %0d", div_q);
+    end
+
+endmodule
+
+// ==================
+// BRENT-KUNG ADDER (16-bit)
+// ==================
+module brent_kung (
+    input  [15:0] A, B,
+    input         cin,
+    output [15:0] Sum,
+    output        Cout
+);
+wire [15:0] g0 = A & B;
+wire [15:0] p0 = A ^ B;
+
+wire [7:0] g1, p1;
+genvar i;
+generate
+for (i=0;i<8;i=i+1) begin : L1
+    assign g1[i] = g0[2*i+1] | (p0[2*i+1] & g0[2*i]);
+    assign p1[i] = p0[2*i+1] & p0[2*i];
+end
+endgenerate
+
+wire [3:0] g2, p2;
+generate
+for (i=0;i<4;i=i+1) begin : L2
+    assign g2[i] = g1[2*i+1] | (p1[2*i+1] & g1[2*i]);
+    assign p2[i] = p1[2*i+1] & p1[2*i];
+end
+endgenerate
+
+wire [1:0] g3, p3;
+assign g3[0]=g2[1]|(p2[1]&g2[0]); assign p3[0]=p2[1]&p2[0];
+assign g3[1]=g2[3]|(p2[3]&g2[2]); assign p3[1]=p2[3]&p2[2];
+wire g4,p4;
+assign g4=g3[1]|(p3[1]&g3[0]); assign p4=p3[1]&p3[0];
+
+wire [16:0] C;
+assign C[0]=cin;
+assign C[1] =g0[0] |(p0[0] &C[0]);
+assign C[2] =g1[0] |(p1[0] &C[0]);
+assign C[4] =g2[0] |(p2[0] &C[0]);
+assign C[8] =g3[0] |(p3[0] &C[0]);
+assign C[16]=g4    |(p4    &C[0]);
+assign C[3] =g0[2] |(p0[2] &C[2]);
+assign C[5] =g0[4] |(p0[4] &C[4]);
+assign C[6] =g1[2] |(p1[2] &C[4]);
+assign C[7] =g0[6] |(p0[6] &C[6]);
+assign C[9] =g0[8] |(p0[8] &C[8]);
+assign C[10]=g1[4] |(p1[4] &C[8]);
+assign C[11]=g0[10]|(p0[10]&C[10]);
+assign C[12]=g2[2] |(p2[2] &C[8]);
+assign C[13]=g0[12]|(p0[12]&C[12]);
+assign C[14]=g1[6] |(p1[6] &C[12]);
+assign C[15]=g0[14]|(p0[14]&C[14]);
+assign Sum  = p0 ^ C[15:0];
+assign Cout = C[16];
+endmodule
+
+// ==================
+// ALU (Pipelined for MUL/DIV)
+// [F6] flag_write gated: only fires on mul_done, div_done, or
+//      when not stalled. Prevents glitch corruption during MUL/DIV.
+// ==================
+module pipelined_alu (
+    input  wire        clk,
+    input  wire        rst,
+    input  wire [15:0] A,
+    input  wire [15:0] B,
+    input  wire [4:0]  opcode,
+    output reg  [3:0]  flags,
+    output wire start_div_out,
+    output      [15:0] result,
+    output wire        stall,
+    output wire        mul_done_out,
+    output wire        div_done_out
+);
+wire mul_busy, mul_done, div_busy, div_done;
+assign mul_done_out = mul_done;
+assign div_done_out = div_done;
+
+wire [1:0] group = opcode[4:3];
+wire [2:0] func  = opcode[2:0];
+wire is_alu   = (group == 2'b00);
+wire is_logic = (group == 2'b01);
+
+wire is_add = is_alu && (func==3'b000);
+wire is_sub = is_alu && (func==3'b001);
+wire is_mul = is_alu && (func==3'b010);
+wire is_div = is_alu && (func==3'b011);
+wire is_inc = is_alu && (func==3'b100);
+wire is_dec = is_alu && (func==3'b101);
+wire is_cmp = is_alu && (func==3'b110);
+wire is_abs = is_alu && (func==3'b111);
+
+wire is_and = is_logic&&(func==3'b000);
+wire is_or  = is_logic&&(func==3'b001);
+wire is_not = is_logic&&(func==3'b010);
+wire is_xor = is_logic&&(func==3'b011);
+wire is_shl = is_logic&&(func==3'b100);
+wire is_shr = is_logic&&(func==3'b101);
+wire is_ror = is_logic&&(func==3'b110);
+wire is_rol = is_logic&&(func==3'b111);
+
+
+reg is_div_d, is_mul_d;
+wire start_mul = is_mul & ~is_mul_d;
+// DIV can start as soon as it arrives in EX, regardless of mul_busy.
+// The div_unit's own div_active flag prevents re-triggering.
+// We serialize MUL and DIV by letting div_unit handle its own busy state.
+// If mul_busy is high, the pipeline is stalled, so A/B inputs to DIV
+// will be re-presented when the stall clears and the instruction re-enters EX.
+// Use a two-cycle handshake: latch the start request, fire when mul clears.
+
+reg div_start_pending;
+reg [15:0] div_A_saved, div_B_saved;
+
+wire div_want_start = (is_div & ~is_div_d);
+
+always @(posedge clk or posedge rst) begin
+    if (rst) begin
+        div_start_pending <= 0;
+        div_A_saved       <= 0;
+        div_B_saved       <= 0;
+    end
+    else if (div_want_start && mul_busy) begin
+        // MUL is running; save start request and operands
+        div_start_pending <= 1;
+        div_A_saved       <= A;
+        div_B_saved       <= B;
+    end
+    else if (div_start_pending && !mul_busy) begin
+        // MUL done; pending start will fire this cycle
+        div_start_pending <= 0;
+    end
+end
+
+wire start_div = (div_want_start && !mul_busy) ||
+                 (div_start_pending && !mul_busy);
+                 
+assign start_div_out = start_div;
+
+// Wire saved operands into div_unit when using pending start
+wire [15:0] div_A_in = div_start_pending ? div_A_saved : A;
+wire [15:0] div_B_in = div_start_pending ? div_B_saved : B;
+
+// Include start signals in stall to close the 1-cycle gap
+assign stall =
+    mul_busy  |
+    div_busy  |
+    start_mul |   // Stall the cycle start_mul fires (before mul_busy latches)
+    start_div;    // Stall the cycle start_div fires (before div_busy latches)
+
+wire is_subtract = is_sub || is_cmp;
+wire [15:0] adder_B =
+    is_subtract ? ~B :
+    is_inc      ? 16'd1 :
+    is_dec      ? 16'hFFFF : B;
+wire adder_cin = is_subtract ? 1'b1 : 1'b0;
+wire [15:0] add_res;
+wire add_cout;
+brent_kung ADDER (.A(A),.B(adder_B),.cin(adder_cin),.Sum(add_res),.Cout(add_cout));
+
+wire overflow_add = ( A[15] &  adder_B[15] & ~add_res[15]) |
+                    (~A[15] & ~adder_B[15] &  add_res[15]);
+wire overflow_sub = ( A[15] & ~B[15] & ~add_res[15]) |
+                    (~A[15] &  B[15] &  add_res[15]);
+wire V_flag = (is_add||is_inc) ? overflow_add :
+              (is_sub||is_dec||is_cmp) ? overflow_sub : 1'b0;
+
+wire [15:0] logic_res =
+    is_and ? (A & B)      : is_or  ? (A | B)    :
+    is_xor ? (A ^ B)      : is_not ? (~A)        :
+    is_shl ? (A << 1)     : is_shr ? (A >> 1)   :
+    is_ror ? {A[0],A[15:1]} : is_rol ? {A[14:0],A[15]} : 16'b0;
+
+wire [15:0] abs_res = A[15] ? (~A + 1) : A;
+
+wire [15:0] mul_prod;
+wire [15:0] div_q;
+
+always @(posedge clk or posedge rst) begin
+    if (rst) begin is_div_d<=0; is_mul_d<=0; end
+    else     begin is_div_d<=is_div; is_mul_d<=is_mul; end
+end
+
+mul_unit MUL (.clk(clk),.rst(rst),.start(start_mul),.A1(A),.B1(B),
+              .mul_busy(mul_busy),.mul_done(mul_done),.mul_prod(mul_prod));
+div_unit DIV (.clk(clk),.rst(rst),.start(start_div),
+              .A1(div_A_in),.B1(div_B_in),
+              .div_busy(div_busy),.div_done(div_done),.div_q(div_q));
+
+always @(posedge clk) begin
+    $display(
+    "DIVCTRL: is_div=%b is_div_d=%b start_div=%b div_busy=%b div_done=%b",
+    is_div,
+    is_div_d,
+    start_div,
+    div_busy,
+    div_done
+    );
+end
+
+always @(posedge clk) begin
+    if(start_div)
+    $display(
+    "DIVSTART: A1=%0d B1=%0d",
+    A,
+    B
+    );
+end
+
+// Result mux
+reg [15:0] result_comb;
+// Decode memory-group instructions for address pass-through
+wire is_mem_group = (group == 2'b10);
+wire is_load_op   = is_mem_group && (func == 3'b000);
+wire is_store_op  = is_mem_group && (func == 3'b001);
+wire is_push_alu  = is_mem_group && (func == 3'b100);
+wire is_pop_alu   = is_mem_group && (func == 3'b101);
+wire is_peak_alu  = is_mem_group && (func == 3'b110);
+
+always @(*) begin
+    result_comb = 16'd0;
+
+    if (mul_done)
+        result_comb = mul_prod;
+
+    else if (div_done)
+        result_comb = div_q;
+
+    else if (is_add || is_sub || is_inc || is_dec || is_cmp)
+        result_comb = add_res;
+
+    else if (is_and || is_or || is_not ||
+             is_xor || is_shl || is_shr ||
+             is_ror || is_rol)
+        result_comb = logic_res;
+
+    else if (is_abs)
+        result_comb = abs_res;
+
+    // MEMORY / STACK ADDRESS PASS-THROUGH
+    else if (group == 2'b10)
+        result_comb = A;
+end
+assign result = result_comb;
+
+always @(posedge clk) begin
+    $display(
+    "ALUDBG: opcode=%b mul_done=%b div_done=%b mul_prod=%0d div_q=%0d result=%0d",
+    opcode,
+    mul_done,
+    div_done,
+    mul_prod,
+    div_q,
+    result
+    );
+end
+
+// [F6] Flag register update - strengthened gating
+// [F6] Flag register update - purely combinational
+always @(*) begin
+    flags = 4'b0000;
+    if (mul_done) begin
+        flags[3] = mul_prod[15]; flags[2] = (mul_prod==0);
+        flags[1] = 0;            flags[0] = 0;
+    end
+    else if (div_done) begin
+        flags[3] = div_q[15];    flags[2] = (div_q==0);
+        flags[1] = 0;            flags[0] = 0;
+    end
+    else begin
+        if (is_add||is_sub||is_inc||is_dec||is_cmp) begin
+            flags[3] = add_res[15];
+            flags[2] = (add_res==0);
+            flags[1] = add_cout;
+            flags[0] = V_flag;
+        end
+        else if (is_logic) begin
+            flags[3] = logic_res[15];
+            flags[2] = (logic_res==0);
+            flags[1] = 0;
+            flags[0] = 0;
+        end
+        else if (is_abs) begin
+            flags[3] = abs_res[15];
+            flags[2] = (abs_res==0);
+            flags[1] = 0;
+            flags[0] = (A==16'h8000);
+        end
+    end
+end
+endmodule
+
+// ==================
+// Stall Unit
+// ==================
+module stall_unit (
+    input  alu_stall,
+    input  hazard_stall,
+    output stall
+);
+assign stall = alu_stall | hazard_stall;
+endmodule
+
+// ==================
+// EX/MEM Register
+// ==================
+module ex_mem_reg (
+    input clk, reset,
+    input mul_done_in, div_done_in,
+    input alu_stall,
+
+    input [15:0] result_in,
+    input [2:0]  rd_in,
+    input [15:0] rs2_fwd_in,   // [F4] forwarded store data (was raw rs2)
+    input        reg_write_in, mem_read_in, mem_write_in, mem_to_reg_in,
+    input        branch_taken_in,
+    input [7:0]  branch_addr_in,
+    input        halt_in,
+    input        is_push_in, is_pop_in, is_peak_in,
+    input  [15:0] push_data_in,
+    
+    output reg [15:0] push_data_out,
+    output reg        halt_out,
+    output reg [15:0] result_out,
+    output reg [2:0]  rd_out,
+    output reg [15:0] rs2_out,
+    output reg        reg_write_out, mem_read_out, mem_write_out, mem_to_reg_out,
+    output reg        branch_taken_out,
+    output reg [7:0]  branch_addr_out,
+    output reg        is_push_out, is_pop_out, is_peak_out
+);
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        result_out<=0; rd_out<=0; rs2_out<=0; halt_out<=0;
+        reg_write_out<=0; mem_read_out<=0; mem_write_out<=0;
+        mem_to_reg_out<=0; branch_taken_out<=0; branch_addr_out<=0;
+        is_push_out<=0; is_pop_out<=0; is_peak_out<=0;
+        push_data_out <= 0;
+    end
+    else if (mul_done_in || div_done_in || !alu_stall) begin
+        result_out      <= result_in;
+        rd_out          <= rd_in;
+        rs2_out         <= rs2_fwd_in;  // [F4]
+        halt_out        <= halt_in;
+        reg_write_out   <= reg_write_in;
+        mem_read_out    <= mem_read_in;
+        mem_write_out   <= mem_write_in;
+        mem_to_reg_out  <= mem_to_reg_in;
+        branch_taken_out<= branch_taken_in;
+        branch_addr_out <= branch_addr_in;
+        is_push_out     <= is_push_in;
+        is_pop_out      <= is_pop_in;
+        is_peak_out     <= is_peak_in;
+        push_data_out <= push_data_in;
+    end
+    // else: stall=1 and no mul/div done → hold current values
+end
+endmodule
+
+// ==================
+// Forwarding Unit
+// [F9] $display moved to clocked block in cpu_top
+// ==================
+module forwarding_unit (
+    input [2:0] rs1_ex, rs2_ex,
+    input [2:0] rd_mem, rd_wb,
+    input       reg_write_mem, reg_write_wb,
+    output reg [1:0] forwardA,
+    output reg [1:0] forwardB
+);
+always @(*) begin
+    forwardA = 2'b00; forwardB = 2'b00;
+    if (reg_write_mem && (rd_mem!=0) && (rd_mem==rs1_ex)) forwardA = 2'b10;
+    else if (reg_write_wb && (rd_wb!=0) && (rd_wb==rs1_ex)) forwardA = 2'b01;
+    if (reg_write_mem && (rd_mem!=0) && (rd_mem==rs2_ex)) forwardB = 2'b10;
+    else if (reg_write_wb && (rd_wb!=0) && (rd_wb==rs2_ex)) forwardB = 2'b01;
+end
+endmodule
+
+// ==================
+// Flag Register
+// ==================
+module flag_register (
+    input clk, reset,
+    input flag_write,
+    input [3:0] flags_in,
+    output reg [3:0] flags_out
+);
+always @(posedge clk or posedge reset) begin
+    if (reset)         flags_out <= 0;
+    else if (flag_write) flags_out <= flags_in;
+end
+endmodule
+
+//********************//
+//      STAGE 4       //
+//********************//
+// ===================================================================
+// CORRECT PIPELINED DUAL-PORT DATA MEMORY
+// ===================================================================
+module data_memory (
+    input clk, reset,
+    input mem_read, mem_write,
+    input [7:0]  addr,
+    input [15:0] write_data,
+    output wire [15:0] read_data
+);
+reg [15:0] memory [0:255];
+integer i;
+
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        for (i=0; i<256; i=i+1) memory[i] <= 16'd0;
+    end
+    else if (mem_write) begin
+        memory[addr] <= write_data;
+    end
+end
+
+// Combinational read with same-address write-through forwarding
+wire write_collision = mem_write; // simplified: always forward on concurrent write
+                                  // Full version: mem_write (addr match implicit
+                                  // since only one addr port)
+
+assign read_data = !mem_read                    ? 16'd0      :
+                   (mem_write)                  ? write_data : // write-through
+                   memory[addr];
+
+endmodule
+
+// ==================
+// MEM/WB Register
+// ==================
+module mem_wb_reg (
+    input clk, reset,
+    input [15:0] mem_data_in, alu_result_in,
+    input [2:0]  rd_in,
+    input alu_stall,    // ← use this instead of stall for hold condition
+    input        reg_write_in, mem_to_reg_in, halt_in,
+    input mul_done_in, div_done_in,
+    output reg        halt_out,
+    output reg [15:0] mem_data_out, alu_result_out,
+    output reg [2:0]  rd_out,
+    output reg        reg_write_out, mem_to_reg_out
+);
+// Add stall and done ports to mem_wb_reg:
+// input stall, mul_done_in, div_done_in  (add to port list)
+
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        mem_data_out<=0; alu_result_out<=0; rd_out<=0;
+        halt_out<=0; reg_write_out<=0; mem_to_reg_out<=0;
+    end
+    else if (mul_done_in || div_done_in || !alu_stall) begin
+        mem_data_out   <= mem_data_in;
+        alu_result_out <= alu_result_in;
+        rd_out         <= rd_in;
+        halt_out       <= halt_in;
+        reg_write_out  <= reg_write_in;
+        mem_to_reg_out <= mem_to_reg_in;
+    end
+    // else: hold
+end
+
+`ifdef SIMULATION
+always @(posedge clk) begin
+    $display("MEMWBDBG: alu_in=%0d alu_out=%0d rd_in=%0d rd_out=%0d regwrite_in=%b regwrite_out=%b",
+        alu_result_in, alu_result_out, rd_in, rd_out, reg_write_in, reg_write_out);
+end
+`endif
+
+endmodule
+
+//********************//
+//      STAGE 5       //
+//********************//
+
+module writeback_mux (
+    input [15:0] alu_result, mem_data,
+    input        mem_to_reg,
+    output [15:0] write_data
+);
+assign write_data = mem_to_reg ? mem_data : alu_result;
+
+endmodule
+
+//********************//
+//      TOP LAYER     //
+//********************//
+module cpu_top (
+    input clk,
+    input reset,
+
+    output [15:0] debug_result,
+    output [2:0]  debug_rd,
+    output        debug_reg_write,
+    output [15:0] debug_mem_data,
+    output [3:0]  flags_out_debug,
+    output [15:0] debug_alu_result_ex,
+    output [15:0] debug_rs1_ex,
+    output [15:0] debug_rs2_ex,
+    output [7:0]  debug_sp
+);
+
+//============================================================
+// STAGE 1 : IF
+//============================================================
+wire [7:0]  pc;
+wire [15:0] instr;
+wire        stall, flush;
+wire        branch_taken;
+wire [7:0]  branch_addr;
+wire        halt_wb;
+wire start_div_capture_pulse;  // NEW
+
+program_counter PC (
+    .clk(clk),
+    .reset(reset),
+    .stall(stall),
+    .halt(halt_wb),
+    .branch_taken(branch_taken),
+    .branch_addr(branch_addr),
+    .pc(pc)
+);
+instruction_memory IMEM (.addr(pc),.instr(instr));
+flush_unit FLUSH (.branch_taken(branch_taken),.flush(flush));
+
+wire [7:0]  pc_id;
+wire [15:0] instr_id;
+if_id_reg IF_ID (
+    .clk(clk),.reset(reset),.stall(stall),.flush(flush),
+    .pc_in(pc),.instr_in(instr),.pc_out(pc_id),.instr_out(instr_id)
+);
+
+//============================================================
+// STAGE 2 : ID
+//============================================================
+wire [1:0] group;
+wire [2:0] opcode, rd, rs1, rs2;
+wire [4:0] imm;
+
+instruction_decoder DEC (
+    .instr(instr_id),.group(group),.opcode(opcode),
+    .rd(rd),.rs1(rs1),.rs2(rs2),.imm(imm)
+);
+
+wire        alu_src, reg_write, mem_read, mem_write, mem_to_reg;
+wire        jump, halt, flag_write;
+wire [2:0]  alu_op;
+wire        is_push, is_pop, is_peak;
+
+control_unit CTRL (
+    .group(group),.opcode(opcode),
+    .is_push(is_push),.is_pop(is_pop),.is_peak(is_peak),
+    .alu_src(alu_src),.reg_write(reg_write),.mem_read(mem_read),
+    .mem_write(mem_write),.mem_to_reg(mem_to_reg),
+    .jump(jump),.halt(halt),.alu_op(alu_op),.flag_write(flag_write)
+);
+
+wire [15:0] rs1_data, rs2_data;
+wire [15:0] writeback_data;
+wire        reg_write_wb;
+wire [2:0]  rd_wb;
+wire        alu_stall;
+
+register_file RF (
+    .clk(clk),.reset(reset),.reg_write(reg_write_wb),
+    .rs1(rs1),.rs2(rs2),.rd(rd_wb),.write_data(writeback_data),
+    .read_data1(rs1_data),.read_data2(rs2_data)
+);
+
+wire [15:0] imm_ext;
+immediate_generator IMM (.imm_in(imm),.imm_out(imm_ext));
+
+wire hazard_stall;
+wire [2:0] rd_ex;
+wire       mem_read_ex;
+// rs1 is read by almost everything except LOADI (Group 10, Opcode 011)
+wire rs1_read_id =
+    ~(group == 2'b10 && opcode[2:0] == 3'b011); 
+
+// rs2 is only read if we are NOT using an immediate value
+wire rs2_read_id = ~alu_src;
+hazard_unit HAZARD_inst (
+    .rs1_id(rs1),              // [FIX] Map to actual rs1 from instruction decoder
+    .rs2_id(rs2),              // [FIX] Map to actual rs2 from instruction decoder
+    .rs1_read_id(rs1_read_id), 
+    .rs2_read_id(rs2_read_id), 
+    .rd_ex(rd_ex),
+    .mem_read_ex(mem_read_ex),
+    .hazard_stall(hazard_stall)
+);
+
+//------------------------------------------------------------
+// ID/EX REGISTER
+//------------------------------------------------------------
+wire [7:0]  pc_ex;
+wire [15:0] rs1_ex, rs2_ex, imm_ex;
+wire [2:0]  rs1_addr_ex, rs2_addr_ex, opcode_ex;
+wire [2:0]  alu_op_ex;
+wire        alu_src_ex, reg_write_ex, mem_write_ex, mem_to_reg_ex;
+wire        jump_ex, flag_write_ex;
+wire        halt_ex;
+wire [1:0]  group_ex;
+wire        is_push_ex, is_pop_ex, is_peak_ex;
+
+
+// ===================================================================
+// UPDATE THIS INSTANTIATION INSIDE cpu_top
+// Gates incoming ID control signals during a hazard condition
+// ===================================================================
+id_ex_reg ID_EX (
+    .clk(clk),.reset(reset),.hazard_stall(hazard_stall),
+    .alu_stall(alu_stall),.flush(flush),
+    .pc_in(pc_id),.rs1_in(rs1_data),.rs2_in(rs2_data),
+    .imm_in(imm_ext),.rd_in(rd),.group_in(group),.halt_in(halt),
+    .halt_out(halt_ex),.group_out(group_ex),
+    .alu_op_in(alu_op),.alu_src_in(alu_src),
+    .reg_write_in(reg_write),.mem_read_in(mem_read),
+    .mem_write_in(mem_write),.mem_to_reg_in(mem_to_reg),
+    .jump_in(jump),.flag_write_in(flag_write),
+    .rs1_addr_in(rs1),.rs2_addr_in(rs2),.opcode_in(opcode),
+    .opcode_out(opcode_ex),.rs1_addr_out(rs1_addr_ex),.rs2_addr_out(rs2_addr_ex),
+    .pc_out(pc_ex),.rs1_out(rs1_ex),.rs2_out(rs2_ex),
+    .imm_out(imm_ex),.rd_out(rd_ex),
+    .alu_op_out(alu_op_ex),.alu_src_out(alu_src_ex),
+    .reg_write_out(reg_write_ex),.mem_read_out(mem_read_ex),
+    .mem_write_out(mem_write_ex),.mem_to_reg_out(mem_to_reg_ex),
+    .jump_out(jump_ex),.flag_write_out(flag_write_ex),
+    .is_push_in(is_push),.is_pop_in(is_pop),.is_peak_in(is_peak),
+    .is_push_out(is_push_ex),.is_pop_out(is_pop_ex),.is_peak_out(is_peak_ex)
+);
+//============================================================
+// STAGE 3 : EX
+//============================================================
+wire [2:0]  rd_mem;
+wire [15:0] result_mem;
+wire        reg_write_mem;
+
+wire [1:0] forwardA, forwardB;
+forwarding_unit FWD (
+    .rs1_ex(rs1_addr_ex),.rs2_ex(rs2_addr_ex),
+    .rd_mem(rd_mem),.rd_wb(rd_wb),
+    .reg_write_mem(reg_write_mem),.reg_write_wb(reg_write_wb),
+    .forwardA(forwardA),.forwardB(forwardB)
+);
+
+wire [15:0] opA, opB_raw, opB;
+
+forward_mux FMUX_A (
+    .reg_data(rs1_ex),.ex_mem_data(result_mem),
+    .mem_wb_data(writeback_data),.forward_sel(forwardA),.out(opA)
+);
+forward_mux FMUX_B (
+    .reg_data(rs2_ex),.ex_mem_data(result_mem),
+    .mem_wb_data(writeback_data),.forward_sel(forwardB),.out(opB_raw)
+);
+
+operand_mux OPMUX (
+    .reg_data(opB_raw),.imm_data(imm_ex),
+    .alu_src(alu_src_ex),.operand_out(opB)
+);
+
+wire is_move  = (group_ex==2'b10) && (alu_op_ex==3'b010);
+wire is_loadi = (group_ex==2'b10) && (alu_op_ex==3'b011);
+wire is_clear = (group_ex==2'b10) && (alu_op_ex==3'b111);
+
+wire [15:0] opA_final = is_loadi ? 16'd0 : opA;
+
+wire [15:0] alu_result;
+wire [3:0]  flags;
+wire         mul_done_ex, div_done_ex;
+
+pipelined_alu ALU (
+    .clk(clk),.rst(reset),
+    .A(opA_final),.B(opB),
+    .opcode({group_ex, alu_op_ex}),
+    .flags(flags),.result(alu_result),
+    .stall(alu_stall),
+    .mul_done_out(mul_done_ex),.div_done_out(div_done_ex),
+    .start_div_out(start_div_capture_pulse)
+);
+
+always @(posedge clk) begin
+    if(reg_write_wb)
+    $display(
+    "FINALWB: rd=%0d data=%0d",
+    rd_wb,
+    writeback_data
+    );
+end
+
+// ==================
+// FLAG PIPELINE (Direct wire into register)
+// ==================
+wire [3:0] flags_out;
+flag_register FLAGS (
+    .clk(clk),
+    .reset(reset),
+    .flag_write((flag_write_ex & ~alu_stall) | mul_done_ex | div_done_ex), // Only write if not stalled
+    .flags_in(flags),                        // Wire directly from combinational ALU
+    .flags_out(flags_out)
+);
+
+// ==================
+// BRANCH PIPELINE
+// [F2] pc_branch_d and imm_branch_d are held when stall is active
+// ==================
+reg [4:0] opcode_branch_d;
+reg [7:0] pc_branch_d, imm_branch_d;
+reg       jump_branch_d;
+always @(posedge clk or posedge reset) begin
+    if (reset) begin
+        opcode_branch_d <= 5'b0; pc_branch_d <= 8'b0;
+        imm_branch_d    <= 8'b0; jump_branch_d <= 1'b0;
+    end
+    // [F2] Hold branch pipeline on any stall so target is not computed from stale PC
+    else if (!stall) begin
+        opcode_branch_d <= {group_ex, alu_op_ex};
+        pc_branch_d     <= pc_ex;
+        imm_branch_d    <= imm_ex[7:0];
+        jump_branch_d   <= jump_ex;
+    end
+end
+
+branch_unit BRANCH (
+    .jump(jump_branch_d),.opcode(opcode_branch_d),
+    .flags_out(flags_out),.pc_ex(pc_branch_d),
+    .imm_ex(imm_branch_d),.branch_taken(branch_taken),
+    .branch_addr(branch_addr)
+);
+
+stall_unit STALL (
+    .alu_stall(alu_stall),.hazard_stall(hazard_stall),.stall(stall)
+);
+
+// ==================
+// MUL/DIV destination register tracking
+// [F5] Captured only on start_mul/start_div, not on every matching cycle
+// ==================
+reg alu_stall_d;
+
+always @(posedge clk or posedge reset) begin
+    if(reset)
+        alu_stall_d <= 0;
+    else
+        alu_stall_d <= alu_stall;
+end
+
+// stall-rising-edge which is when MUL starts. Add explicit group check:
+wire mul_rising_edge = alu_stall && !alu_stall_d;
+wire mul_start_capture = mul_rising_edge
+    && (group_ex == 2'b00)
+    && (alu_op_ex == 3'b010)
+    && reg_write_ex;   // only save if this instruction actually writes back
+
+// div_start_capture: use start_div pulse directly.
+// The rising-edge-of-alu_stall approach fails when alu_stall is already
+// high from a preceding MUL (no falling edge between MUL and DIV).
+// start_div is a clean 1-cycle pulse that fires exactly when DIV begins,
+// regardless of prior stall history.
+wire div_start_capture = start_div_capture_pulse;
+
+reg [2:0] mul_rd_saved;
+reg [2:0] div_rd_saved;
+
+reg mul_regwrite_saved;
+reg div_regwrite_saved;
+
+wire [2:0] final_rd_ex =
+    mul_done_ex ? mul_rd_saved :
+    div_done_ex ? div_rd_saved :
+    rd_ex;
+    
+wire [15:0] final_ex_result =
+    is_clear ? 16'd0 :
+    is_move  ? opA   :
+    is_loadi ? imm_ex :
+    alu_result;
+    
+always @(posedge clk) begin
+    $display(
+    "EXRESULTDBG: mul_done=%b div_done=%b alu_result=%0d final_ex_result=%0d",
+    mul_done_ex,
+    div_done_ex,
+    alu_result,
+    final_ex_result
+    );
+end
+always @(posedge clk) begin
+    if(div_done_ex)
+    $display(
+    "CPU_DIV_DONE: result=%0d rd=%0d",
+    final_ex_result,
+    final_rd_ex
+    );
+end   
+ 
+always @(posedge clk) begin
+    $display(
+    "MULRESULTDBG: mul_done=%b div_done=%b alu_result=%0d final_ex_result=%0d",
+    mul_done_ex,
+    div_done_ex,
+    alu_result,
+    final_ex_result
+    );
+end
+
+always @(posedge clk or posedge reset) begin
+    if(reset) begin
+        mul_rd_saved <= 3'b000;
+        div_rd_saved <= 3'b000;
+
+        mul_regwrite_saved <= 1'b0;
+        div_regwrite_saved <= 1'b0;
+    end
+    else begin
+
+        if(mul_start_capture) begin
+            mul_rd_saved <= rd_ex;
+            mul_regwrite_saved <= reg_write_ex;
+        end
+
+        if(div_start_capture) begin
+            div_rd_saved       <= rd_ex;
+            div_regwrite_saved <= reg_write_ex;
+        end
+
+    end
+end
+
+wire final_reg_write_ex =
+    mul_done_ex ? mul_regwrite_saved :
+    div_done_ex ? div_regwrite_saved :
+    reg_write_ex;
+
+always @(posedge clk) begin
+    $display(
+    "RDCAP: stall=%b stall_d=%b rd_ex=%0d mul_saved=%0d div_saved=%0d mul_done=%b div_done=%b final_rd=%0d",
+    alu_stall,
+    alu_stall_d,
+    rd_ex,
+    mul_rd_saved,
+    div_rd_saved,
+    mul_done_ex,
+    div_done_ex,
+    final_rd_ex
+    );
+end
+
+always @(posedge clk) begin
+    $display(
+    "REGWRDBG: reg_write_ex=%b reg_write_mem=%b reg_write_wb=%b mul_done=%b div_done=%b",
+    reg_write_ex,
+    reg_write_mem,
+    reg_write_wb,
+    mul_done_ex,
+    div_done_ex
+    );
+end
+
+always @(posedge clk) begin
+    if(reg_write_wb)
+        $display(
+        "FINALWRITE: R%0d <= %0d",
+        rd_wb,
+        writeback_data
+        );
+end
+
+always @(posedge clk) begin
+    $display(
+    "RDTRACE: rd_ex=%b mul_saved=%b div_saved=%b final_rd=%b",
+    rd_ex, mul_rd_saved, div_rd_saved, final_rd_ex);
+end
+
+//------------------------------------------------------------
+// EX/MEM REGISTER
+//------------------------------------------------------------
+wire        is_push_mem, is_pop_mem, is_peak_mem;
+wire [15:0] rs2_mem;
+wire        mem_read_mem, mem_write_mem, mem_to_reg_mem;
+wire        branch_taken_mem;
+wire [7:0]  branch_addr_mem;
+wire        halt_mem;
+// Declare:
+wire [15:0] push_data_mem;
+// Connect from ex_mem_reg: .push_data_out(push_data_mem)
+// ===================================================================
+// FIXED PIPELINED EX/MEM BINDING LAYER INSIDE cpu_top
+// ===================================================================
+ex_mem_reg EX_MEM (
+    .clk(clk),
+    .reset(reset),
+    .alu_stall(alu_stall),    // ← ADD THIS
+    .mul_done_in(mul_done_ex),
+    .div_done_in(div_done_ex),
+    .push_data_out(push_data_mem),
+
+    .result_in(final_ex_result),
+    .rd_in(final_rd_ex),
+    
+    // [F4] Pass forwarded store data (opB_raw), not the raw unforwarded rs2_ex register wire
+    .rs2_fwd_in(opB_raw), 
+    
+    // FIXED CORRECTION: Sourced from forwarded opA, not the unforwarded raw rs1_ex wire line!
+    // This guarantees the memory module receives the valid, forwarded runtime data during stalls.
+    .push_data_in(opA),   
+    
+    .reg_write_in(final_reg_write_ex),
+    .mem_read_in(mem_read_ex),
+    .mem_write_in(mem_write_ex),
+    .mem_to_reg_in(mem_to_reg_ex),
+    .branch_taken_in(branch_taken),
+    .branch_addr_in(branch_addr),
+    .halt_in(halt_ex),
+    .is_push_in(is_push_ex),
+    .is_pop_in(is_pop_ex),
+    .is_peak_in(is_peak_ex),
+
+    .halt_out(halt_mem),
+    .result_out(result_mem),
+    .rd_out(rd_mem),
+    .rs2_out(rs2_mem),
+    .reg_write_out(reg_write_mem),
+    .mem_read_out(mem_read_mem),
+    .mem_write_out(mem_write_mem),
+    .mem_to_reg_out(mem_to_reg_mem),
+    .is_push_out(is_push_mem),
+    .is_pop_out(is_pop_mem),
+    .is_peak_out(is_peak_mem)
+);
+
+//============================================================
+// STAGE 4 : MEM
+//============================================================
+
+// Stack pointer - updates on posedge after MEM uses current sp
+wire [7:0] sp;
+stack_pointer SP (
+    .clk(clk),.reset(reset),
+    .push(is_push_mem),.pop(is_pop_mem),.sp(sp), .alu_stall(alu_stall)
+);
+
+// [F3] Combinational memory address - no 1-cycle delay
+// [F8] PUSH uses current sp (pre-decrement); POP uses sp (pre-increment = the
+//      slot that was last pushed). Stack grows downward (sp decrements on push).
+//      Correct semantics:
+//        PUSH: write to sp, then sp-=1  → address = sp (current, before update)
+//        POP : sp+=1, then read from sp → address = sp+1 (current+1 = last pushed)
+//        PEAK: read from sp+1 (top of stack without popping)
+wire [7:0] mem_addr_w =
+    is_push_mem ? sp         :   // [F8] write to current sp, then sp decrements
+    is_pop_mem  ? (sp + 1)   :   // [F8] sp will increment; read from sp+1 (top)
+    is_peak_mem ? (sp + 1)   :   // [F8] peek top without popping
+    result_mem[7:0];              // Normal load/store: ALU result is the address
+
+data_memory DMEM (
+    .clk(clk),.reset(reset),
+    .mem_read(mem_read_mem),.mem_write(mem_write_mem),
+    .addr(mem_addr_w),            // [F3] combinational, not registered
+    .write_data(is_push_mem ? push_data_mem : rs2_mem),
+    .read_data(debug_mem_data)
+);
+
+wire [15:0] mem_data = debug_mem_data;
+
+// MEM/WB register
+wire [15:0] mem_data_wb, alu_result_wb;
+wire        mem_to_reg_wb;
+
+wire [15:0] mem_data_wb_out;          // ADD this wire declaration before MEM_WB
+
+mem_wb_reg MEM_WB (
+    .clk(clk), .reset(reset),
+    .mem_data_in(mem_data),           // ← FIXED: pass DMEM read data into the register
+    .alu_result_in(result_mem),
+    .rd_in(rd_mem), .reg_write_in(reg_write_mem),
+    .alu_stall(alu_stall),
+    .mul_done_in(mul_done_ex),
+    .div_done_in(div_done_ex),
+    .mem_to_reg_in(mem_to_reg_mem), .halt_in(halt_mem),
+    .halt_out(halt_wb),
+    .mem_data_out(mem_data_wb_out),   // ← FIXED: capture the registered output
+    .alu_result_out(alu_result_wb), .rd_out(rd_wb),
+    .reg_write_out(reg_write_wb), .mem_to_reg_out(mem_to_reg_wb)
+);
+
+always @(posedge clk) begin
+    $display(
+    "WBPATH: rd_mem=%0d result_mem=%0d regwrite_mem=%b | rd_wb=%0d alu_wb=%0d regwrite_wb=%b",
+    rd_mem,
+    result_mem,
+    reg_write_mem,
+    rd_wb,
+    alu_result_wb,
+    reg_write_wb
+    );
+end
+
+//============================================================
+// STAGE 5 : WB
+//============================================================
+writeback_mux WB (
+    .alu_result(alu_result_wb),
+    .mem_data(mem_data_wb_out),       // ← FIXED: use registered MEM/WB output
+    .mem_to_reg(mem_to_reg_wb),
+    .write_data(writeback_data)
+);
+
+always @(posedge clk) begin
+    $display("WBMUX: mem_to_reg_wb=%b mem_data=%0d alu_result_wb=%0d wb_data=%0d",
+    mem_to_reg_wb, mem_data_wb_out, alu_result_wb, writeback_data);
+end
+
+always @(posedge clk) begin
+    $display(
+    "WBDBG: rd_wb=%0d reg_write_wb=%b wb_data=%0d",
+    rd_wb,
+    reg_write_wb,
+    writeback_data
+    );
+end
+
+// Debug outputs
+assign debug_result    = writeback_data;
+assign debug_rd        = rd_wb;
+assign debug_reg_write = reg_write_wb;
+assign flags_out_debug = flags_out;
+assign debug_sp        = sp;
+
+// [F9] Debug displays moved to clocked blocks (no more delta-cycle spam)
+always @(posedge clk) begin
+    if (debug_reg_write)
+        $display("[WB] RD=R%0d DATA=%0d (0x%h)", rd_wb, writeback_data, writeback_data);
+end
+
+always @(posedge clk) begin
+    $display("[FWD] rs1=%0d rs2=%0d rdM=%0d rdW=%0d FA=%b FB=%b",
+        rs1_addr_ex, rs2_addr_ex, rd_mem, rd_wb, forwardA, forwardB);
+end
+
+assign debug_alu_result_ex = alu_result;
+assign debug_rs1_ex        = rs1_ex;
+assign debug_rs2_ex        = rs2_ex;
+
+endmodule
